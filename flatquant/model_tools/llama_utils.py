@@ -111,8 +111,9 @@ class FlatQuantLlamaMLP(LlamaMLP):
 
 class FlatQuantLlamaAttention(LlamaAttention):
     def __init__(self, args, module: LlamaAttention):
-        super().__init__(module.config, module.layer_idx)
+        super().__init__(module.config)
         self.args = args
+        self.layer_idx = getattr(module, "layer_idx", None)
         
         self.q_proj = FlatQuantizedLinear(args, module.q_proj)
         self.k_proj = FlatQuantizedLinear(args, module.k_proj)
@@ -213,13 +214,16 @@ class FlatQuantLlamaAttention(LlamaAttention):
 
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
-            if self.layer_idx is None:
-                raise ValueError(
-                    f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
-                    "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
-                    "with a layer index."
-                )
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            if hasattr(past_key_value, "get_usable_length"):
+                if self.layer_idx is None:
+                    raise ValueError(
+                        f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
+                        "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
+                        "with a layer index."
+                    )
+                kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            else:
+                kv_seq_len += past_key_value[0].shape[-2]
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
         # ---- here do the quantization ----
@@ -228,8 +232,13 @@ class FlatQuantLlamaAttention(LlamaAttention):
             value_states = self.quant_vcache(value_states)
 
         if past_key_value is not None:
-            cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            if hasattr(past_key_value, "update"):
+                cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
+                key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            else:
+                key_states = torch.cat([past_key_value[0], key_states], dim=2)
+                value_states = torch.cat([past_key_value[1], value_states], dim=2)
+                past_key_value = (key_states, value_states) if use_cache else None
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups) # bnsh
@@ -250,7 +259,6 @@ class FlatQuantLlamaAttention(LlamaAttention):
 
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
         attn_output = torch.matmul(attn_weights, value_states)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
@@ -283,6 +291,8 @@ class FlatQuantLlamaAttention(LlamaAttention):
                     attn_output = self.o_proj(attn_output)
         if not output_attentions:
             attn_weights = None
+        if past_key_value is None and use_cache:
+            past_key_value = (key_states, value_states)
         return attn_output, attn_weights, past_key_value
 
     def reparameterize(self):
