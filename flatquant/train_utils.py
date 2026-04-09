@@ -7,9 +7,45 @@ from contextlib import nullcontext
 import torch
 import torch.nn as nn
 import transformers
+import numpy as np
 
 from flatquant.function_utils import set_require_grad_all, get_n_set_parameters_byname, get_paras_dict_by_name, check_params_grad
 from flatquant.quant_utils import set_quantizer_state
+
+
+def load_svd_loss_state(args, dev):
+    if not getattr(args, "svd_loss", False):
+        return None
+    if args.svd_file is None:
+        raise ValueError("--svd_loss is enabled but --svd_file is not provided.")
+
+    svd_results = np.load(args.svd_file)
+    s = torch.from_numpy(svd_results['s']).to(torch.float32)
+    Vh = torch.from_numpy(svd_results['Vh']).to(torch.float32)
+    V = Vh.transpose(0, 1).contiguous()
+
+    if args.svd_weight_mode == "sigma2":
+        w = s.pow(2)
+    elif args.svd_weight_mode == "sigma2_norm":
+        w = s.pow(2)
+        w = w / w.mean()
+    else:
+        raise NotImplementedError(f"Unsupported svd_weight_mode: {args.svd_weight_mode}")
+
+    return {
+        "V": V.to(dev),
+        "w": w.to(dev),
+    }
+
+
+def compute_recon_loss(fp_out, quant_out, svd_state=None):
+    if svd_state is None:
+        return torch.nn.functional.mse_loss(fp_out, quant_out)
+
+    err = fp_out - quant_out
+    err_proj = torch.matmul(err, svd_state["V"].to(err))
+    weighted_err = err_proj.pow(2) * svd_state["w"].to(err)
+    return weighted_err.mean()
 
 def cali_flat_quant(args, model, dataloader, dev, logger):
     model.eval()
@@ -81,7 +117,10 @@ def cali_flat_quant(args, model, dataloader, dev, logger):
     fp_inps = inps   # take output of fp model as input
     fp_outs = torch.zeros_like(inps)   # take output of fp model as input
 
-    loss_func = torch.nn.MSELoss()
+    svd_state = load_svd_loss_state(args, dev)
+    if svd_state is not None:
+        logger.info(f"Using SVD-weighted reconstruction loss from: {args.svd_file}")
+        logger.info(f"SVD weight mode: {args.svd_weight_mode}")
     # start training
     flat_parameters = {}
     num_train_layer = len(layers)
@@ -142,7 +181,7 @@ def cali_flat_quant(args, model, dataloader, dev, logger):
                 for j in range(args.nsamples // args.cali_bsz):
                     index = j * args.cali_bsz
                     quant_out = layer(fp_inps[index:index+args.cali_bsz,], attention_mask=attention_mask_batch, position_ids=position_ids)[0]
-                    loss = loss_func(fp_outs[index:index+args.cali_bsz,], quant_out)
+                    loss = compute_recon_loss(fp_outs[index:index+args.cali_bsz,], quant_out, svd_state=svd_state)
                     mse += loss.detach().cpu()
                     loss = loss / loss.clone().detach()
                     optimizer.zero_grad()
@@ -169,4 +208,3 @@ def cali_flat_quant(args, model, dataloader, dev, logger):
     torch.cuda.empty_cache()
     model.config.use_cache = use_cache
     return model
-

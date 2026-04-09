@@ -6,22 +6,6 @@ from termcolor import colored
 import pprint
 
 
-supported_models = [
-            './modelzoo/meta-llama/Llama-2-7b-hf',
-            './modelzoo/meta-llama/Llama-2-13b-hf',
-            './modelzoo/meta-llama/Llama-2-70b-hf',
-            './modelzoo/meta-llama/Meta-Llama-3-8B',
-            './modelzoo/meta-llama/Meta-Llama-3-70B',
-            './modelzoo/meta-llama/Meta-Llama-3-8B-Instruct',
-            './modelzoo/meta-llama/Meta-Llama-3-70B-Instruct',
-            './modelzoo/meta-llama/Llama-3.1-8B', 
-            './modelzoo/meta-llama/Llama-3.1-70B', 
-            './modelzoo/meta-llama/Llama-3.1-8B-Instruct', 
-            './modelzoo/meta-llama/Llama-3.1-70B-Instruct', 
-            './modelzoo/meta-llama/Llama-3.3-70B-Instruct', 
-            './modelzoo/Qwen/Qwen2.5-7B-Instruct', 
-            './modelzoo/Qwen/Qwen2.5-32B-Instruct', 
-            ]
 supported_datasets = ['wikitext2', 'c4', 'pile']
 
 
@@ -30,7 +14,7 @@ def parser_gen():
 
     # General Arguments
     parser.add_argument('--model', type=str, default='meta-llama/Llama-2-7b-hf',
-                        help='Model to load.', choices=supported_models)
+                        help='Model to load.')
     parser.add_argument('--seed', type=int, default=0, help='Random seed for HuggingFace and PyTorch.')
     parser.add_argument('--hf_token', type=str, default=None, help='HuggingFace token for model access.')
 
@@ -96,6 +80,13 @@ def parser_gen():
                         help="Use the inverse method in PyTorch to directly get the inverse matrix rather than SVD.")
     parser.add_argument("--separate_vtrans", default=False, action="store_true", 
                         help="Disable the integration of the vtrans transformation.")
+    parser.add_argument("--svd_loss", default=False, action="store_true",
+                        help="Use SVD-weighted reconstruction loss instead of plain MSE.")
+    parser.add_argument("--svd_file", type=str, default=None,
+                        help="Path to the .npz file containing lm_head SVD results.")
+    parser.add_argument("--svd_weight_mode", type=str, default="sigma2_norm",
+                        choices=["sigma2", "sigma2_norm"],
+                        help="How to construct directional weights from singular values.")
     
     # KV-Cache Quantization Arguments
     parser.add_argument('--q_bits', type=int, default=16,

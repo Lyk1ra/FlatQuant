@@ -4,6 +4,12 @@ import torch.nn as nn
 from flatquant.flat_utils import kronecker_matmul
 from flatquant.function_utils import get_init_weight, get_inverse
 
+if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "preferred_linalg_library"):
+    try:
+        torch.backends.cuda.preferred_linalg_library("magma")
+    except Exception:
+        pass
+
 # ---------- transformation version of singular value decomposition ----------
 class SVDSingleTransMatrix(nn.Module):
     def __init__(self, size):
