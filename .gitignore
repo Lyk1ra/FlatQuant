@@ -16,3 +16,5 @@ log_*.txt
 *.pth
 modelzoo/*
 outputs/*
+# 忽略第三方库cutlass的整个目录
+third-party/cutlass/
