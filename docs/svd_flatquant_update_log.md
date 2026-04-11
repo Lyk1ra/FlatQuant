@@ -169,3 +169,181 @@ Suggested next directions:
 ### Maintenance Note
 
 This file is intended to be updated continuously as further SVD-FlatQuant experiments and code changes are made.
+
+## 2026-04-11
+
+### Goal Update
+
+After confirming that the previous Qwen2.5-3B-Instruct SVD comparison was performed only under a small, weakened stability configuration, we switched the main experimental target to:
+
+- `Qwen2.5-3B` **base**
+
+The new objective was:
+
+1. establish a reliable full FlatQuant baseline on the base model
+2. re-compute the LM-head SVD for the base model rather than reusing the instruct-model spectrum
+3. compare the stable full baseline against the SVD-weighted variant under the same full configuration
+
+### Why We Switched to the Base Model
+
+We decided to use the **base** model instead of the instruct model for the following reason:
+
+- the downstream target is quantization methodology research rather than instruction tuning evaluation
+- a base model is therefore the cleaner object for subsequent structural modifications such as SVD-based loss design
+
+### Stable Full FlatQuant Baseline Search on Qwen2.5-3B Base
+
+We first evaluated the unquantized floating-point model to establish a reference:
+
+#### FP baseline
+
+- WikiText2 PPL: `8.0357`
+- C4 PPL: `13.3594`
+
+We then tested a sequence of FlatQuant configurations under the full paper-style calibration regime:
+
+- `nsamples=128`
+- `epochs=15`
+- `cali_bsz=4`
+- `flat_lr=5e-3`
+- `W4A4KV4`
+- `KV group size = 128`
+- `--cali_trans --add_diag`
+- `--deactive_amp --direct_inv`
+
+#### 1. No-clip strong baseline
+
+Configuration:
+
+- no `lwc`
+- no `lac`
+
+Results:
+
+- WikiText2 PPL: `9.7057`
+- C4 PPL: `15.7275`
+
+This confirmed that Qwen2.5-3B base can be quantized stably under the full training budget even without clipping parameters.
+
+#### 2. Only `lwc`
+
+Results:
+
+- WikiText2 PPL: `9.1693`
+- C4 PPL: `15.1297`
+
+This showed that `lwc` alone is stable and improves over the no-clip baseline.
+
+#### 3. Only `lac`
+
+Results:
+
+- WikiText2 PPL: `9.2173`
+- C4 PPL: `15.0455`
+
+This showed that `lac` alone is also stable and improves over the no-clip baseline.
+
+#### 4. Full baseline with `lwc + lac`
+
+Results:
+
+- WikiText2 PPL: `8.8095`
+- C4 PPL: `14.5661`
+
+This is the best FlatQuant baseline we obtained on Qwen2.5-3B base in the current codebase, and it became the reference baseline for the subsequent SVD experiment.
+
+### Interpretation of the Baseline Search
+
+The earlier very poor results previously observed on Qwen should not be interpreted as evidence that FlatQuant fundamentally fails on Qwen2.5-3B. Under the full paper-style budget and the stabilized engineering settings:
+
+- `--deactive_amp`
+- `--direct_inv`
+
+the model can be quantized normally.
+
+Moreover:
+
+- `lwc` alone helps
+- `lac` alone helps
+- `lwc + lac` helps the most
+
+So the working conclusion is that the stable full FlatQuant baseline on Qwen2.5-3B base is valid and usable for further research.
+
+### Recomputing SVD for the Base Model
+
+Because the previous SVD analysis file had been generated from the instruct model, we recomputed the LM-head SVD specifically for the base model.
+
+Source project:
+
+- `proj/SVD_A`
+
+Adjustment made:
+
+- switched `SVD_A/config.py` from `Qwen/Qwen2.5-3B-Instruct` to the local base-model path
+
+Final model path used for SVD computation:
+
+- `/gammadisk/liuxuanang/proj/FlatQuant/modelzoo/Qwen/Qwen2.5-3B`
+
+LM-head matrix shape:
+
+- `(151936, 2048)`
+
+Generated SVD file:
+
+- `/gammadisk/liuxuanang/proj/SVD_A/results/svd/_gammadisk_liuxuanang_proj_FlatQuant_modelzoo_Qwen_Qwen2.5-3B_svd.npz`
+
+### Full SVD-Weighted FlatQuant Run on Qwen2.5-3B Base
+
+We then ran the SVD-weighted variant under the same full, stable baseline configuration, with the additional arguments:
+
+- `--svd_loss`
+- `--svd_file /gammadisk/liuxuanang/proj/SVD_A/results/svd/_gammadisk_liuxuanang_proj_FlatQuant_modelzoo_Qwen_Qwen2.5-3B_svd.npz`
+- `--svd_weight_mode sigma2_norm`
+
+Results:
+
+- WikiText2 PPL: `8.8400`
+- C4 PPL: `14.5785`
+
+### Comparison: Best Baseline vs SVD-Weighted Version
+
+#### Best baseline (`lwc + lac`)
+
+- WikiText2 PPL: `8.8095`
+- C4 PPL: `14.5661`
+
+#### SVD-weighted baseline (`lwc + lac + svd_loss`)
+
+- WikiText2 PPL: `8.8400`
+- C4 PPL: `14.5785`
+
+### Final Interpretation of Current SVD Attempt
+
+The current SVD integration is **functionally correct and numerically stable** on Qwen2.5-3B base:
+
+- the base-specific SVD file is correctly loaded
+- the run completes successfully
+- there is no NaN or OOM failure
+
+However, under the current formulation:
+
+- shared LM-head spectrum across all layers
+- `sigma2_norm` directional weighting
+- full replacement of plain MSE by SVD-weighted reconstruction loss
+
+the SVD-weighted variant does **not** outperform the best stable baseline. It is only slightly worse on both WikiText2 and C4.
+
+This means the present conclusion is:
+
+- **the SVD feature has been successfully integrated into FlatQuant for Qwen2.5-3B base**
+- **but the current weighting design does not yet provide empirical gain over the stable non-SVD baseline**
+
+### Recommended Next Steps
+
+The next SVD-specific improvements should focus on the loss design rather than baseline stability. Reasonable directions include:
+
+1. try weaker weighting than `sigma^2`
+2. add a mixed objective such as `alpha * mse + beta * svd_loss`
+3. test alternative normalized weight functions
+4. investigate whether a single shared LM-head spectrum is too coarse for all transformer layers
