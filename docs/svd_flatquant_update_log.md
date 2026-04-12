@@ -347,3 +347,278 @@ The next SVD-specific improvements should focus on the loss design rather than b
 2. add a mixed objective such as `alpha * mse + beta * svd_loss`
 3. test alternative normalized weight functions
 4. investigate whether a single shared LM-head spectrum is too coarse for all transformer layers
+
+## 2026-04-12
+
+### Diagnostic Goal
+
+After obtaining the result that the SVD-weighted run was slightly worse in final PPL than the best non-SVD baseline, we investigated a more precise question:
+
+- does the SVD-weighted method at least reduce the error that is more directly related to the final `lm_head` output space?
+
+This required revisiting what the logged training `mse` actually meant.
+
+### What the Original Logged `mse` Actually Was
+
+In the original training logs, each layer printed a field named `mse`.
+
+However, this field was not always the same mathematical object across experiments:
+
+- without `--svd_loss`, the logged `mse` was exactly the plain reconstruction MSE between the floating-point layer output and the quantized layer output
+- with `--svd_loss`, the logged `mse` was actually the **SVD-weighted reconstruction loss**, because the same logging variable was reused for the optimized objective
+
+Therefore, the old logs could not answer the question:
+
+- whether the SVD-weighted method reduces error in the final output-head-related directions
+
+This was a major source of ambiguity in the previous interpretation.
+
+### Why the Logging Needed to Be Changed
+
+Our mathematical motivation for SVD-weighted FlatQuant is not to reduce plain hidden-state MSE uniformly in every direction, but to reduce error along directions that matter more for the final `lm_head` output.
+
+So, to diagnose the method correctly, we needed to log three different quantities separately:
+
+1. the actual optimized objective
+2. the plain hidden-state reconstruction MSE
+3. an `lm_head`-related output-space proxy error
+
+### First Failed Attempt and Why It Was Replaced
+
+We first attempted to log an explicit head-output MSE by constructing the error after projection through the full output head:
+
+- `logits_err = e @ W^T`
+
+where:
+
+- `e = y_fp - y_quant`
+- `W = lm_head.weight`
+
+This immediately caused CUDA OOM on both runs, because the vocabulary dimension is very large and the explicit logits error tensor is too expensive to materialize.
+
+So this explicit version was discarded.
+
+More explicitly, the quantity we originally intended to measure was the explicit output-head-space mean squared error:
+
+- `head_mse_explicit = mean((e @ W^T)^2)`
+
+with:
+
+- `e = y_fp - y_quant`
+- `W = lm_head.weight`
+
+This is the most direct way to ask whether the quantization error becomes smaller after projection into the final logits space.
+
+However, for Qwen2.5-3B the vocabulary dimension is very large, so for a batch of hidden states with shape roughly:
+
+- `[bsz, seqlen, hidden] = [4, 2048, 2048]`
+
+the explicit logits error would have shape roughly:
+
+- `[4, 2048, vocab] = [4, 2048, 151936]`
+
+This intermediate tensor is too large, so the explicit implementation caused immediate OOM on both diagnostic reruns. Therefore, the explicit head-space MSE could not be used in practice.
+
+### Final Diagnostic Metrics Added to the Code
+
+We then updated `flatquant/train_utils.py` so that each layer now logs:
+
+- `optimized_loss`
+- `plain_mse`
+- `head_proxy_mse`
+
+#### 1. `plain_mse`
+
+This is the usual hidden-state reconstruction MSE:
+
+- `plain_mse = mean((y_fp - y_quant)^2)`
+
+#### 2. `optimized_loss`
+
+This is the actual training objective used by the run:
+
+- for baseline FlatQuant: `optimized_loss = plain_mse`
+- for SVD-weighted FlatQuant: `optimized_loss = svd_weighted_loss`
+
+So `optimized_loss` is not the same quantity across the two experiment types.
+
+#### 3. `head_proxy_mse`
+
+To avoid materializing the full logits-space error tensor, we used the quadratic form induced by the output head.
+
+Let:
+
+- `W = lm_head.weight = U diag(s) V^T`
+- `e = y_fp - y_quant`
+
+The explicit logits-space squared error is related to:
+
+- `||eW^T||^2`
+
+Using:
+
+- `W^T W = V diag(s^2) V^T`
+
+we define the proxy:
+
+- `e_proj = eV`
+- `head_proxy_mse = mean(e_proj^2 * s^2)`
+
+This quantity is not the explicit per-logit MSE tensor itself, but it corresponds to the same `W^T W`-induced quadratic form and is therefore the correct low-memory proxy for the head-output-sensitive error we care about.
+
+The mathematical reason this replacement is valid is the following:
+
+- the explicit logits-space squared error is based on `||eW^T||^2`
+- by expanding the quadratic form we get `e W^T W e^T`
+- with `W = U diag(s) V^T`, we have `W^T W = V diag(s^2) V^T`
+
+Therefore, the explicit head-space error and the proxy are governed by the same output-head-induced quadratic form. In other words:
+
+- the explicit version asks for the squared error after projecting into the full logits space
+- the proxy version evaluates the same geometry without explicitly materializing the logits tensor
+
+So the replacement was not an ad-hoc engineering trick; it was a mathematically motivated low-memory reformulation of the same output-head-sensitive error structure.
+
+### New Diagnostic Experiment Setup
+
+To compare the two methods under the new diagnostics, we reran the two full configurations:
+
+#### Baseline diagnostic run
+
+- model: `Qwen2.5-3B` base
+- config: `lwc + lac`
+- GPU: `0`
+- exp name: `qwen25_3b_base_w4a4kv4_lwc_lac_full_headmse_gpu0`
+
+#### SVD diagnostic run
+
+- model: `Qwen2.5-3B` base
+- config: `lwc + lac + svd_loss`
+- `svd_weight_mode = sigma2_norm`
+- GPU: `3`
+- exp name: `qwen25_3b_base_w4a4kv4_lwc_lac_svd_full_headmse_gpu3`
+
+### Final PPL Results of the Diagnostic Re-runs
+
+The diagnostic reruns reproduced the previous conclusion:
+
+#### Baseline (`lwc + lac`)
+
+- WikiText2 PPL: `8.8095`
+- C4 PPL: `14.5661`
+
+#### SVD-weighted (`lwc + lac + svd_loss`)
+
+- WikiText2 PPL: `8.8400`
+- C4 PPL: `14.5785`
+
+So the final perplexity result remains unchanged:
+
+- SVD-weighted FlatQuant is still slightly worse than the best stable baseline
+
+### What the New Diagnostics Showed
+
+The new logs revealed a much more nuanced picture than the old single `mse` field.
+
+#### Observation 1. `optimized_loss` does not become systematically smaller
+
+In many layers, especially later layers, the SVD run has a larger final `optimized_loss` than the baseline run.
+
+Important note:
+
+- this does **not** mean the SVD method necessarily failed mathematically, because `optimized_loss` is not the same function across the two runs
+
+Still, it shows that the SVD-weighted objective is not easier to optimize in practice.
+
+#### Observation 2. `plain_mse` is often slightly worse with SVD
+
+Across many layers, the SVD run ends with a slightly larger plain hidden-state MSE than the non-SVD baseline.
+
+This means the SVD method often sacrifices ordinary hidden-space reconstruction quality.
+
+#### Observation 3. `head_proxy_mse` is often smaller with SVD, especially in important later layers
+
+This is the most important new result.
+
+For several layers, including some late layers near the output head, the SVD run obtains:
+
+- larger `plain_mse`
+- but smaller `head_proxy_mse`
+
+This means the SVD-weighted method really is pushing the error toward directions that are less harmful under the `lm_head`-induced quadratic form.
+
+### Representative Layer Comparisons
+
+#### Layer 0
+
+- baseline: `plain_mse = 0.17738493`, `head_proxy_mse = 16.23518562`
+- SVD: `plain_mse = 0.17842296`, `head_proxy_mse = 15.79053974`
+
+Interpretation:
+
+- plain MSE is slightly worse
+- head-sensitive proxy error is better
+
+#### Layer 20
+
+- baseline: `plain_mse = 0.38674530`, `head_proxy_mse = 37.50878906`
+- SVD: `plain_mse = 0.39270559`, `head_proxy_mse = 37.00822067`
+
+Interpretation:
+
+- plain MSE is worse
+- head-sensitive proxy error is better
+
+#### Layer 34
+
+- baseline: `plain_mse = 8.62847614`, `head_proxy_mse = 897.73602295`
+- SVD: `plain_mse = 9.07591629`, `head_proxy_mse = 869.42364502`
+
+Interpretation:
+
+- plain MSE is clearly worse
+- head-sensitive proxy error is clearly better
+
+#### Layer 35
+
+- baseline: `plain_mse = 9.59827709`, `head_proxy_mse = 1187.19238281`
+- SVD: `plain_mse = 10.40928078`, `head_proxy_mse = 1125.40075684`
+
+Interpretation:
+
+- plain MSE is significantly worse
+- head-sensitive proxy error is significantly better
+
+This is especially important because layer 35 is the final transformer block, i.e. the closest hidden representation before the final norm and `lm_head`.
+
+### Main Conclusion of This Diagnostic Round
+
+The new diagnostics show that the current SVD-weighted method is **not** simply “worse in every respect”. Instead, the picture is:
+
+- it often worsens ordinary hidden-state MSE
+- it often does **not** look better in the raw optimized-loss scalar
+- but it does improve the `lm_head`-related proxy error in several layers, especially some important late ones
+
+So the most accurate interpretation is:
+
+- the SVD weighting is doing something directionally meaningful
+- it is indeed reshaping the reconstruction error toward directions that are more favorable under the output-head quadratic form
+- but this improvement is currently not strong enough, or not globally coordinated enough, to produce better final perplexity
+
+### Updated Research Interpretation
+
+This means the current bottleneck is no longer best described as:
+
+- “the SVD idea does nothing”
+
+Instead, it is better described as:
+
+- “the SVD idea does affect the error geometry in the intended direction, but the current loss design induces a trade-off that does not yet improve end-task performance”
+
+### Implication for Next Steps
+
+Future SVD work should focus on keeping the gain in `head_proxy_mse` while reducing the damage to `plain_mse`. The most natural next directions are:
+
+1. use a weaker spectral weighting than `sigma^2`
+2. switch from full replacement to a mixed objective
+3. keep the new diagnostic logs permanently, because a single `mse` field is not enough to interpret SVD-vs-baseline behavior correctly

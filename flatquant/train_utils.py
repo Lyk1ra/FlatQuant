@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import transformers
 import numpy as np
+import torch.nn.functional as F
 
 from flatquant.function_utils import set_require_grad_all, get_n_set_parameters_byname, get_paras_dict_by_name, check_params_grad
 from flatquant.quant_utils import set_quantizer_state
@@ -35,6 +36,7 @@ def load_svd_loss_state(args, dev):
     return {
         "V": V.to(dev),
         "w": w.to(dev),
+        "s2": s.pow(2).to(dev),
     }
 
 
@@ -45,6 +47,17 @@ def compute_recon_loss(fp_out, quant_out, svd_state=None):
     err = fp_out - quant_out
     err_proj = torch.matmul(err, svd_state["V"].to(err))
     weighted_err = err_proj.pow(2) * svd_state["w"].to(err)
+    return weighted_err.mean()
+
+
+def compute_plain_mse(fp_out, quant_out):
+    return F.mse_loss(fp_out, quant_out)
+
+
+def compute_head_proxy_mse(fp_out, quant_out, svd_like_state):
+    err = fp_out - quant_out
+    err_proj = torch.matmul(err, svd_like_state["V"].to(err))
+    weighted_err = err_proj.pow(2) * svd_like_state["s2"].to(err)
     return weighted_err.mean()
 
 def cali_flat_quant(args, model, dataloader, dev, logger):
@@ -121,6 +134,21 @@ def cali_flat_quant(args, model, dataloader, dev, logger):
     if svd_state is not None:
         logger.info(f"Using SVD-weighted reconstruction loss from: {args.svd_file}")
         logger.info(f"SVD weight mode: {args.svd_weight_mode}")
+    if svd_state is None:
+        with torch.no_grad():
+            lm_head_weight = model.lm_head.weight.detach().to(torch.float32)
+            _, s_head, Vh_head = torch.linalg.svd(lm_head_weight, full_matrices=False)
+            head_proxy_state = {
+                "V": Vh_head.transpose(0, 1).contiguous().to(dev),
+                "s2": s_head.pow(2).to(dev),
+            }
+            del lm_head_weight, s_head, Vh_head
+            torch.cuda.empty_cache()
+    else:
+        head_proxy_state = {
+            "V": svd_state["V"],
+            "s2": svd_state["s2"],
+        }
     # start training
     flat_parameters = {}
     num_train_layer = len(layers)
@@ -175,21 +203,31 @@ def cali_flat_quant(args, model, dataloader, dev, logger):
         # check_params_grad(layer)
         # set_quantizer_state(layer, False)
         for epoch in range(args.epochs):
-            mse = 0
+            optimized_loss_sum = 0
+            plain_mse_sum = 0
+            head_mse_sum = 0
             start_tick = time.time()
             with traincast():
                 for j in range(args.nsamples // args.cali_bsz):
                     index = j * args.cali_bsz
+                    fp_batch = fp_outs[index:index+args.cali_bsz,]
                     quant_out = layer(fp_inps[index:index+args.cali_bsz,], attention_mask=attention_mask_batch, position_ids=position_ids)[0]
-                    loss = compute_recon_loss(fp_outs[index:index+args.cali_bsz,], quant_out, svd_state=svd_state)
-                    mse += loss.detach().cpu()
+                    loss = compute_recon_loss(fp_batch, quant_out, svd_state=svd_state)
+                    plain_mse = compute_plain_mse(fp_batch.float(), quant_out.float())
+                    head_proxy_mse = compute_head_proxy_mse(fp_batch.float(), quant_out.float(), head_proxy_state)
+                    optimized_loss_sum += loss.detach().cpu()
+                    plain_mse_sum += plain_mse.detach().cpu()
+                    head_mse_sum += head_proxy_mse.detach().cpu()
                     loss = loss / loss.clone().detach()
                     optimizer.zero_grad()
                     loss.backward()
                     optimizer.step()
                     scheduler.step()
             cur_lr = optimizer.state_dict()['param_groups'][0]['lr']
-            logger.info(f"layer {i} lwc lac iter {epoch}, lr {cur_lr:.8f}  time {time.time() - start_tick:.6f}s, mse: {mse:.8f}" )
+            logger.info(
+                f"layer {i} lwc lac iter {epoch}, lr {cur_lr:.8f}  time {time.time() - start_tick:.6f}s, "
+                f"optimized_loss: {optimized_loss_sum:.8f}, plain_mse: {plain_mse_sum:.8f}, head_proxy_mse: {head_mse_sum:.8f}"
+            )
 
         fp_inps, fp_outs = fp_outs, fp_inps
         layers[i] = layer.to("cpu")
