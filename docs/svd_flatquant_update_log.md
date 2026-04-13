@@ -622,3 +622,124 @@ Future SVD work should focus on keeping the gain in `head_proxy_mse` while reduc
 1. use a weaker spectral weighting than `sigma^2`
 2. switch from full replacement to a mixed objective
 3. keep the new diagnostic logs permanently, because a single `mse` field is not enough to interpret SVD-vs-baseline behavior correctly
+
+## 2026-04-13
+
+### Goal Update
+
+After completing the PPL-based comparison and the head-proxy diagnostic round, we decided to extend the downstream comparison with additional zero-shot tasks instead of continuing to focus on `WikiText2` / `C4`.
+
+This decision was also motivated by the fact that the explicit head-output MSE path had already been judged too memory-expensive to keep using in routine experiments. The low-memory `head_proxy_mse` diagnostic remains sufficient for internal analysis, while the next empirical question is whether SVD-weighted FlatQuant helps on a broader set of zero-shot tasks.
+
+### Engineering Change for This Round
+
+To support a zero-shot-only evaluation run, we added a CLI switch:
+
+- `--skip_ppl_eval`
+
+This allows `main.py` to skip the fixed `WikiText2` / `C4` perplexity loop and directly run the requested LM Eval tasks.
+
+### Zero-Shot Evaluation Setup
+
+Both runs used:
+
+- model: `Qwen2.5-3B` base
+- quantization: `W4A4KV4`
+- `nsamples=128`
+- `epochs=15`
+- `cali_bsz=4`
+- `flat_lr=5e-3`
+- `--cali_trans --add_diag --lwc --lac --deactive_amp --direct_inv`
+- GPU: `0`
+
+The compared runs were:
+
+#### Baseline zero-shot run
+
+- exp name: `qwen25_3b_base_w4a4kv4_lwc_lac_zeroshot_gpu0`
+- no `--svd_loss`
+
+#### SVD zero-shot run
+
+- exp name: `qwen25_3b_base_w4a4kv4_lwc_lac_svd_zeroshot_gpu0`
+- `--svd_loss`
+- `--svd_file /gammadisk/liuxuanang/proj/SVD_A/results/svd/_gammadisk_liuxuanang_proj_FlatQuant_modelzoo_Qwen_Qwen2.5-3B_svd.npz`
+- `--svd_weight_mode sigma2_norm`
+
+Requested zero-shot task list:
+
+- `piqa`
+- `hellaswag`
+- `arc_easy`
+- `arc_challenge`
+- `winogrande`
+- `lambada_openai`
+- `boolq`
+- `openbookqa`
+- `social_iqa`
+
+### What Actually Completed
+
+Both runs successfully completed the first six tasks and produced valid scores for:
+
+- `piqa`
+- `hellaswag`
+- `arc_easy`
+- `arc_challenge`
+- `winogrande`
+- `lambada_openai`
+
+However, both runs stopped during `boolq` evaluation and therefore did **not** produce results for:
+
+- `boolq`
+- `openbookqa`
+- `social_iqa`
+
+So this round should be interpreted as a **partial but still useful zero-shot comparison**, not a full 9-task completion.
+
+### Completed Zero-Shot Results
+
+| Task | Baseline | SVD | Delta (SVD - Baseline) |
+| --- | ---: | ---: | ---: |
+| `piqa` | `76.22` | `75.95` | `-0.27` |
+| `hellaswag` | `70.50` | `70.50` | `0.00` |
+| `arc_easy` | `73.27` | `72.05` | `-1.22` |
+| `arc_challenge` | `45.99` | `44.37` | `-1.62` |
+| `winogrande` | `65.75` | `65.19` | `-0.56` |
+| `lambada_openai` | `63.21` | `63.19` | `-0.02` |
+
+Average over the six completed tasks:
+
+- baseline 6-task avg: `65.82`
+- SVD 6-task avg: `65.21`
+- delta: `-0.61`
+
+### Interpretation of This Round
+
+Under the currently completed zero-shot subset:
+
+- SVD did **not** outperform the non-SVD FlatQuant baseline
+- `hellaswag` was effectively tied
+- all other completed tasks were slightly worse with SVD
+
+So this round is directionally consistent with the earlier PPL conclusion:
+
+- the current SVD-weighted objective changes the error geometry in a meaningful way
+- but this still does not translate into better downstream accuracy under the present loss design
+
+### Practical Conclusion
+
+At this point, the evidence from three views is aligned:
+
+1. PPL comparison: SVD is slightly worse
+2. head-proxy diagnostics: SVD improves some output-head-sensitive geometry but often worsens plain MSE
+3. partial zero-shot comparison: SVD is again slightly worse overall on the completed tasks
+
+Therefore, the current conclusion remains:
+
+- the present `sigma2_norm` full-replacement SVD loss is analytically interesting and functionally stable
+- but it still does **not** beat the stable non-SVD FlatQuant baseline on `Qwen2.5-3B` base
+
+### Follow-Up Note
+
+Because both runs stopped during `boolq`, the remaining three tasks were not used for the official comparison in this round. If needed later, they should be rerun separately as task-isolated evaluations rather than by reusing the interrupted 9-task batch as if it were complete.

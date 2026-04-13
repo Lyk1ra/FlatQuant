@@ -55,18 +55,19 @@ def main():
     else:
         model.to(utils.DEV)
     
-    # Evaluating PPL
-    for eval_dataset in ["wikitext2", "c4"]:
-        logger.info(eval_dataset)
-        testloader = data_utils.get_loaders(
-                args,
-                eval_dataset,
-                tokenizer,
-                seqlen=model.seqlen,
-                eval_mode=True
-            )
-        dataset_ppl = eval_utils.ppl_eval(model, testloader)
-        logger.info(dataset_ppl)
+    if not args.skip_ppl_eval:
+        # Evaluating PPL
+        for eval_dataset in ["wikitext2", "c4"]:
+            logger.info(eval_dataset)
+            testloader = data_utils.get_loaders(
+                    args,
+                    eval_dataset,
+                    tokenizer,
+                    seqlen=model.seqlen,
+                    eval_mode=True
+                )
+            dataset_ppl = eval_utils.ppl_eval(model, testloader)
+            logger.info(dataset_ppl)
 
 
     if args.lm_eval:

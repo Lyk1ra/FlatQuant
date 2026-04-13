@@ -126,6 +126,10 @@ def parser_gen():
         "--distribute_model",
         action="store_true",
         help="Distribute the model across multiple GPUs for evaluation.")
+    parser.add_argument(
+        "--skip_ppl_eval",
+        action="store_true",
+        help="Skip WikiText2/C4 perplexity evaluation and only run requested LM Eval tasks.")
 
     # Add quantized_save flag
     parser.add_argument('--quantized_save', action = "store_true", default = False,
