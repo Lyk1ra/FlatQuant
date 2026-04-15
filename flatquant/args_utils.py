@@ -85,7 +85,7 @@ def parser_gen():
     parser.add_argument("--svd_file", type=str, default=None,
                         help="Path to the .npz file containing lm_head SVD results.")
     parser.add_argument("--svd_weight_mode", type=str, default="sigma2_norm",
-                        choices=["sigma2", "sigma2_norm"],
+                        choices=["sigma2", "sigma2_norm", "sigma2_norm_clip_low"],
                         help="How to construct directional weights from singular values.")
     
     # KV-Cache Quantization Arguments

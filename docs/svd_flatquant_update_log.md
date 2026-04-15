@@ -1,5 +1,11 @@
 # SVD-Weighted FlatQuant Update Log
 
+## Recording Requirements
+
+1. When writing experiment reports in this log, do not write summary-style or conclusion-style statements in the experiment-result section; record the actual experimental data directly.
+2. When launching experiments, include a timestamp in the experiment naming/logging path to avoid ambiguity across reruns.
+3. Do not include `third-party/cutlass` in routine experiment-related commits for this project.
+
 ## 2026-04-10
 
 ### Goal
@@ -743,3 +749,110 @@ Therefore, the current conclusion remains:
 ### Follow-Up Note
 
 Because both runs stopped during `boolq`, the remaining three tasks were not used for the official comparison in this round. If needed later, they should be rerun separately as task-isolated evaluations rather than by reusing the interrupted 9-task batch as if it were complete.
+
+## 2026-04-15: `sigma2_norm_clip_low` SVD Variant
+
+Following the suggestion to reduce damage on small-singular-value directions, we added a new SVD weighting mode that only keeps SVD amplification on directions whose singular values are larger than the mean singular value.
+
+### Code Change
+
+We added a new CLI mode:
+
+- `--svd_weight_mode sigma2_norm_clip_low`
+
+Its implementation is:
+
+1. first compute the normalized SVD weights
+   - `w = s^2 / mean(s^2)`
+2. then clip low-singular-value directions back to unit weight
+   - if `s_i > mean(s)`, keep `w_i`
+   - if `s_i <= mean(s)`, set `w_i = 1`
+
+This keeps ordinary MSE weighting on low-singular-value directions while preserving stronger weighting on high-singular-value directions.
+
+The corresponding zero-shot/full-eval run script was updated to use:
+
+- `--svd_weight_mode sigma2_norm_clip_low`
+
+### Formal Run Configuration
+
+The formal run used the same main FlatQuant setup as the established baseline, with the only SVD-specific difference being the new weight mode:
+
+- model: `Qwen2.5-3B base`
+- quantization: `W4A4KV4`
+- calibration/training flags:
+  - `--cali_trans --add_diag --lwc --lac --deactive_amp --direct_inv`
+- SVD flags:
+  - `--svd_loss`
+  - `--svd_file /gammadisk/liuxuanang/proj/SVD_A/results/svd/_gammadisk_liuxuanang_proj_FlatQuant_modelzoo_Qwen_Qwen2.5-3B_svd.npz`
+  - `--svd_weight_mode sigma2_norm_clip_low`
+- evaluation scope:
+  - `WikiText2`
+  - `C4`
+  - six zero-shot tasks:
+    - `piqa`
+    - `hellaswag`
+    - `arc_easy`
+    - `arc_challenge`
+    - `winogrande`
+    - `lambada_openai`
+
+### Formal Run Results
+
+Formal run log directory:
+
+- `outputs/Qwen2.5-3B/w4a4/qwen25_3b_base_w4a4kv4_lwc_lac_svd_clip_low_full_eval_gpu3/`
+
+#### PPL
+
+- `WikiText2`: `8.81881332397461`
+- `C4`: `14.60970401763916`
+
+#### Six-task zero-shot
+
+- `piqa`: `77.15`
+- `hellaswag`: `70.55`
+- `arc_easy`: `71.00`
+- `arc_challenge`: `45.48`
+- `winogrande`: `65.67`
+- `lambada_openai`: `63.54`
+- `6-task avg`: `65.57`
+
+#### Head-proxy diagnostic snapshots from the formal run
+
+The training log continues to print `optimized_loss`, `plain_mse`, and `head_proxy_mse` at every layer and epoch. The final-epoch (`iter 14`) `head_proxy_mse` values for representative layers in the formal run were:
+
+- layer 10: `36.75202942`
+- layer 20: `36.26086807`
+- layer 34: `865.69470215`
+- layer 35: `1117.51342773`
+
+### Appendix: Non-formal Run With Runtime Issues
+
+Before the final formal run above, we also executed an earlier `sigma2_norm_clip_low` run on GPU3 that completed evaluation but is not treated as the formal result for this round.
+
+Appendix run log directory:
+
+- earlier GPU3 run under the same experiment name prior to the final rerun
+
+#### Problem observed in that run
+
+During training, the log contained repeated runtime errors from the MAGMA/CUBLAS linear algebra path, including:
+
+- `magma_dgetrs_gpu`
+- `CUBLAS error: out of memory`
+- `memory mapping error`
+
+These messages appeared during the layerwise training stage.
+
+#### Appendix run data
+
+- `WikiText2`: `8.816495895385742`
+- `C4`: `14.604449272155762`
+- `piqa`: `76.28`
+- `hellaswag`: `70.42`
+- `arc_easy`: `70.08`
+- `arc_challenge`: `45.65`
+- `winogrande`: `65.82`
+- `lambada_openai`: `63.46`
+- `6-task avg`: `65.28`

@@ -30,6 +30,11 @@ def load_svd_loss_state(args, dev):
     elif args.svd_weight_mode == "sigma2_norm":
         w = s.pow(2)
         w = w / w.mean()
+    elif args.svd_weight_mode == "sigma2_norm_clip_low":
+        w = s.pow(2)
+        w = w / w.mean()
+        s_mean = s.mean()
+        w = torch.where(s > s_mean, w, torch.ones_like(w))
     else:
         raise NotImplementedError(f"Unsupported svd_weight_mode: {args.svd_weight_mode}")
 
