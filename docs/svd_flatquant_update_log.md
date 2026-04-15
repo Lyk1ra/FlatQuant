@@ -6,6 +6,242 @@
 2. When launching experiments, include a timestamp in the experiment naming/logging path to avoid ambiguity across reruns.
 3. Do not include `third-party/cutlass` in routine experiment-related commits for this project.
 
+## Fixed Normal-Scale Protocol
+
+For `Qwen2.5-3B` base experiments in this project, the default and continuing experiment scale is the established normal-scale configuration:
+
+- `nsamples=128`
+- `epochs=15`
+- `cali_bsz=4`
+- `flat_lr=5e-3`
+- `W4A4KV4`
+- `--cali_trans --add_diag --lwc --lac --deactive_amp --direct_inv`
+
+Unless explicitly recorded as an exceptional diagnostic run, we should continue to use this normal-scale configuration for baseline and new method comparisons.
+
+This means:
+
+- new baseline-vs-method comparisons should stay on the normal scale above
+- reduced-budget screening runs should not be treated as the working default for this project
+- if any non-normal-scale run is ever necessary, it must be clearly marked as exceptional and must not be confused with the normal-scale comparison track
+
+## 2026-04-15: A+B Full-Scale Run Plan
+
+### Goal
+
+For the next SVD step, this round is restricted to the combined direction:
+
+- A: mixed loss
+- B: layer-dependent SVD strength schedule
+
+No reduced-budget screening is used for this round. The run is launched directly under the fixed normal-scale protocol.
+
+### Method Definition
+
+The intended training objective is layer-dependent mixed loss:
+
+- `loss_i = (1 - alpha_i) * plain_mse + alpha_i * svd_weighted_loss`
+
+with linear layer schedule:
+
+- `alpha_i` increases linearly from `0.0` at the first transformer layer to `0.5` at the last transformer layer
+
+SVD weighting configuration for this run:
+
+- `svd_weight_mode = sigma2_norm`
+
+### Formal Run Configuration
+
+- model: `Qwen2.5-3B` base
+- quantization: `W4A4KV4`
+- calibration/training flags:
+  - `--cali_trans --add_diag --lwc --lac --deactive_amp --direct_inv`
+- normal-scale budget:
+  - `nsamples=128`
+  - `epochs=15`
+  - `cali_bsz=4`
+  - `flat_lr=5e-3`
+- SVD / A+B flags:
+  - `--svd_loss`
+  - `--svd_file /gammadisk/liuxuanang/proj/SVD_A/results/svd/_gammadisk_liuxuanang_proj_FlatQuant_modelzoo_Qwen_Qwen2.5-3B_svd.npz`
+  - `--svd_weight_mode sigma2_norm`
+  - `--svd_loss_alpha 0.5`
+  - `--svd_alpha_schedule linear`
+  - `--svd_alpha_start 0.0`
+- evaluation scope:
+  - `WikiText2`
+  - `C4`
+  - six zero-shot tasks:
+    - `piqa`
+    - `hellaswag`
+    - `arc_easy`
+    - `arc_challenge`
+    - `winogrande`
+    - `lambada_openai`
+- target GPU:
+  - GPU `3`
+
+Corresponding script:
+
+- `scripts/qwen-2.5-base/qwen-2.5-3b/w4a4kv4_svd_mix_linear_full_eval_gpu3.sh`
+
+### Logging Rule For This Run
+
+As with the current diagnostic-enabled codepath, training logs for this run should continue to distinguish:
+
+- `optimized_loss`
+- `plain_mse`
+- `head_proxy_mse`
+
+### Code Change
+
+To support the A+B method, we extended the current SVD-loss path so that the optimized objective is no longer limited to two extremes (`plain_mse` only or full SVD replacement only).
+
+Affected code paths for this update:
+
+- `flatquant/args_utils.py`
+- `flatquant/train_utils.py`
+- `scripts/qwen-2.5-base/qwen-2.5-3b/w4a4kv4_svd_mix_linear_full_eval_gpu3.sh`
+
+New CLI arguments added for this round:
+
+- `--svd_loss_alpha`
+- `--svd_alpha_schedule`
+- `--svd_alpha_start`
+
+Current semantics:
+
+- `--svd_loss_alpha`
+  - final-layer SVD mix coefficient
+- `--svd_alpha_schedule`
+  - how to vary the SVD mix across layers
+- `--svd_alpha_start`
+  - first-layer SVD mix coefficient when using a scheduled mix
+
+For this round, the implemented schedule choices are:
+
+- `constant`
+- `linear`
+
+The current code also logs one additional low-cost diagnostic value when SVD loss is enabled:
+
+- SVD weight dynamic range
+
+which reports:
+
+- minimum SVD weight
+- maximum SVD weight
+- `max / min` ratio
+
+### Mathematical Rationale
+
+The motivation for A+B is to preserve the useful directional bias introduced by the output-head spectrum while preventing the full loss-replacement design from over-sacrificing ordinary hidden-state reconstruction.
+
+Let:
+
+- `e = y_fp - y_quant`
+- `W = lm_head.weight = U diag(s) V^T`
+- `e_proj = eV`
+
+Then:
+
+- `plain_mse = mean(e^2)`
+- `svd_weighted_loss = mean(e_proj^2 * w)`
+
+where this run uses:
+
+- `w = s^2 / mean(s^2)`
+
+The A+B mixed objective is:
+
+- `loss_i = (1 - alpha_i) * plain_mse + alpha_i * svd_weighted_loss`
+
+with layer-dependent linear schedule:
+
+- `alpha_i = alpha_start + (alpha_end - alpha_start) * i / (L - 1)`
+
+For the formal run in this round:
+
+- `alpha_start = 0.0`
+- `alpha_end = 0.5`
+
+So the first transformer layer remains pure `plain_mse`, while later layers gradually receive a stronger output-head-sensitive directional bias.
+
+This design was chosen because the previous diagnostic round suggested two things simultaneously:
+
+1. full SVD replacement can improve `head_proxy_mse` in important later layers
+2. full replacement also tends to worsen `plain_mse`, which can damage the layerwise reconstruction chain
+
+Therefore, the mixed objective attempts to retain the later-layer directional benefit while reducing damage to ordinary reconstruction quality, especially in earlier layers.
+
+### Formal Run Log Directory
+
+- `outputs/Qwen2.5-3B/w4a4/qwen25_3b_base_w4a4kv4_lwc_lac_svd_mix_linear_a0p5_full_eval_gpu3_20260415_180145/`
+
+Launcher log:
+
+- `outputs/qwen25_3b_base_w4a4kv4_lwc_lac_svd_mix_linear_a0p5_full_eval_gpu3_20260415_180145.launcher.log`
+
+### Formal Run Results
+
+#### PPL
+
+- `WikiText2`: `8.817450523376465`
+- `C4`: `14.568132400512695`
+
+#### Six-task zero-shot
+
+- `piqa`: `77.09`
+- `hellaswag`: `70.72`
+- `arc_easy`: `71.55`
+- `arc_challenge`: `45.48`
+- `winogrande`: `67.09`
+- `lambada_openai`: `63.75`
+- `6-task avg`: `65.95`
+
+#### Representative final-layer diagnostic snapshot
+
+Final epoch (`iter 14`) of layer 35 from the formal run:
+
+- `optimized_loss`: `11.14162159`
+- `plain_mse`: `9.95463371`
+- `head_proxy_mse`: `1114.93212891`
+
+### Comparison Against The Established Full Baseline
+
+Reference baseline from the existing formal normal-scale run:
+
+- `WikiText2`: `8.8095`
+- `C4`: `14.5661`
+- `6-task avg`: `65.82`
+
+Current A+B formal run:
+
+- `WikiText2`: `8.817450523376465`
+- `C4`: `14.568132400512695`
+- `6-task avg`: `65.95`
+
+### Interpretation Of This Round
+
+Under the fixed normal-scale protocol, the A+B method produced the following pattern:
+
+- `WikiText2` is slightly worse than the established baseline
+- `C4` is also slightly worse than the established baseline
+- the six-task zero-shot average is slightly better than the established baseline
+
+So the current empirical picture is more favorable than the earlier full-replacement `sigma2_norm` SVD attempt, but it still does not provide a clean across-the-board win over the established baseline.
+
+More precisely:
+
+- on perplexity, A+B is extremely close to baseline but still slightly behind
+- on the six completed zero-shot tasks, A+B is slightly ahead on the average
+
+Therefore, the most accurate current conclusion is:
+
+- A+B is a meaningful improvement over the earlier full-replacement SVD design
+- it narrows the PPL gap substantially and slightly improves the six-task zero-shot average
+- but it still has not yet produced a full dominant result over the established normal-scale baseline on `Qwen2.5-3B` base
+
 ## 2026-04-10
 
 ### Goal

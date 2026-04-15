@@ -84,6 +84,13 @@ def parser_gen():
                         help="Use SVD-weighted reconstruction loss instead of plain MSE.")
     parser.add_argument("--svd_file", type=str, default=None,
                         help="Path to the .npz file containing lm_head SVD results.")
+    parser.add_argument("--svd_loss_alpha", type=float, default=1.0,
+                        help="Mixing coefficient for SVD-weighted loss. 0 means plain MSE only; 1 means full SVD objective.")
+    parser.add_argument("--svd_alpha_schedule", type=str, default="constant",
+                        choices=["constant", "linear"],
+                        help="How to schedule SVD loss alpha across layers.")
+    parser.add_argument("--svd_alpha_start", type=float, default=0.0,
+                        help="Layerwise alpha at the first transformer layer when using a scheduled SVD mix.")
     parser.add_argument("--svd_weight_mode", type=str, default="sigma2_norm",
                         choices=["sigma2", "sigma2_norm", "sigma2_norm_clip_low"],
                         help="How to construct directional weights from singular values.")
@@ -138,6 +145,10 @@ def parser_gen():
     args = parser.parse_args()
     if args.a_groupsize > -1:
         raise NotImplementedError
+    if not (0.0 <= args.svd_loss_alpha <= 1.0):
+        raise ValueError("--svd_loss_alpha must be in [0, 1].")
+    if not (0.0 <= args.svd_alpha_start <= 1.0):
+        raise ValueError("--svd_alpha_start must be in [0, 1].")
     
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     args.quantize = (args.w_bits < 16) or (args.a_bits < 16) or (args.q_bits < 16) or (args.k_bits < 16) or (args.v_bits < 16)

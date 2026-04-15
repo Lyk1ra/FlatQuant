@@ -45,14 +45,37 @@ def load_svd_loss_state(args, dev):
     }
 
 
-def compute_recon_loss(fp_out, quant_out, svd_state=None):
+def get_layer_svd_alpha(args, layer_idx, num_layers):
+    if not getattr(args, "svd_loss", False):
+        return 0.0
+
+    alpha_end = float(args.svd_loss_alpha)
+    if args.svd_alpha_schedule == "constant" or num_layers <= 1:
+        return alpha_end
+    if args.svd_alpha_schedule == "linear":
+        alpha_start = float(args.svd_alpha_start)
+        return alpha_start + (alpha_end - alpha_start) * (layer_idx / (num_layers - 1))
+    raise NotImplementedError(f"Unsupported svd_alpha_schedule: {args.svd_alpha_schedule}")
+
+
+def compute_svd_weighted_loss(fp_out, quant_out, svd_state):
     if svd_state is None:
-        return torch.nn.functional.mse_loss(fp_out, quant_out)
+        raise ValueError("svd_state is required for SVD-weighted loss computation.")
 
     err = fp_out - quant_out
     err_proj = torch.matmul(err, svd_state["V"].to(err))
     weighted_err = err_proj.pow(2) * svd_state["w"].to(err)
     return weighted_err.mean()
+
+
+def compute_recon_loss(fp_out, quant_out, svd_state=None, svd_alpha=1.0):
+    plain_mse = compute_plain_mse(fp_out, quant_out)
+    if svd_state is None or svd_alpha <= 0:
+        return plain_mse, plain_mse
+
+    svd_weighted_loss = compute_svd_weighted_loss(fp_out, quant_out, svd_state)
+    loss = (1 - svd_alpha) * plain_mse + svd_alpha * svd_weighted_loss
+    return loss, plain_mse
 
 
 def compute_plain_mse(fp_out, quant_out):
@@ -139,6 +162,15 @@ def cali_flat_quant(args, model, dataloader, dev, logger):
     if svd_state is not None:
         logger.info(f"Using SVD-weighted reconstruction loss from: {args.svd_file}")
         logger.info(f"SVD weight mode: {args.svd_weight_mode}")
+        logger.info(
+            "SVD loss mix: schedule=%s alpha_start=%.6f alpha_end=%.6f"
+            % (args.svd_alpha_schedule, args.svd_alpha_start, args.svd_loss_alpha)
+        )
+        w = svd_state["w"]
+        logger.info(
+            "SVD weight dynamic range: min=%.6f max=%.6f ratio=%.6f"
+            % (w.min().item(), w.max().item(), (w.max() / w.min()).item())
+        )
     if svd_state is None:
         with torch.no_grad():
             lm_head_weight = model.lm_head.weight.detach().to(torch.float32)
@@ -160,6 +192,8 @@ def cali_flat_quant(args, model, dataloader, dev, logger):
     mse_dict = {}
     for i in range(num_train_layer):
         logger.info(f"========= Layer {i} =========")
+        layer_svd_alpha = get_layer_svd_alpha(args, i, num_train_layer)
+        logger.info(f"Layer {i} SVD alpha: {layer_svd_alpha:.6f}")
         dtype_dict = {}
         layer = layers[i].to(dev)
         for name, param in layer.named_parameters():
@@ -217,8 +251,9 @@ def cali_flat_quant(args, model, dataloader, dev, logger):
                     index = j * args.cali_bsz
                     fp_batch = fp_outs[index:index+args.cali_bsz,]
                     quant_out = layer(fp_inps[index:index+args.cali_bsz,], attention_mask=attention_mask_batch, position_ids=position_ids)[0]
-                    loss = compute_recon_loss(fp_batch, quant_out, svd_state=svd_state)
-                    plain_mse = compute_plain_mse(fp_batch.float(), quant_out.float())
+                    loss, plain_mse = compute_recon_loss(
+                        fp_batch.float(), quant_out.float(), svd_state=svd_state, svd_alpha=layer_svd_alpha
+                    )
                     head_proxy_mse = compute_head_proxy_mse(fp_batch.float(), quant_out.float(), head_proxy_state)
                     optimized_loss_sum += loss.detach().cpu()
                     plain_mse_sum += plain_mse.detach().cpu()
