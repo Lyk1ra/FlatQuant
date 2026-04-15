@@ -760,6 +760,11 @@ We added a new CLI mode:
 
 - `--svd_weight_mode sigma2_norm_clip_low`
 
+Affected code paths for this update:
+
+- `flatquant/args_utils.py`
+- `flatquant/train_utils.py`
+
 Its implementation is:
 
 1. first compute the normalized SVD weights
@@ -770,9 +775,11 @@ Its implementation is:
 
 This keeps ordinary MSE weighting on low-singular-value directions while preserving stronger weighting on high-singular-value directions.
 
-The corresponding zero-shot/full-eval run script was updated to use:
+The corresponding scripts for this update are:
 
-- `--svd_weight_mode sigma2_norm_clip_low`
+- `scripts/qwen-2.5-base/qwen-2.5-3b/w4a4kv4_svd_clip_low_full_eval.sh`
+- `scripts/qwen-2.5-base/qwen-2.5-3b/w4a4kv4_svd_clip_low_zeroshot.sh`
+- `scripts/qwen-2.5-base/qwen-2.5-3b/w4a4kv4_svd_clip_low_full_eval_auto.sh`
 
 ### Formal Run Configuration
 
