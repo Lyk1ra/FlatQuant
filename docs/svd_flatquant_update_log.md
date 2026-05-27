@@ -1101,3 +1101,199 @@ Therefore, the most accurate current conclusion is:
 - A+B is a meaningful improvement over the earlier full-replacement SVD design
 - it narrows the PPL gap substantially and slightly improves the six-task zero-shot average
 - but it still has not yet produced a full dominant result over the established normal-scale baseline on `Qwen2.5-3B` base
+
+## 2026-05-28: Qwen2.5-3B Base Outlier Distribution Diagnostic
+
+### Goal
+
+Following the distribution-analysis suggestion, this round checked whether the current SVD / A+B method changes the quantization-relevant outlier structure, rather than only checking final PPL or zero-shot scores.
+
+The diagnostic question was:
+
+- after the transformation, do weight outliers and token / activation outliers become more quantization-friendly?
+- does A+B SVD-FlatQuant add a clear distribution-flattening effect beyond the established FlatQuant baseline?
+
+### Teacher-Suggestion Requirements Reflected In This Round
+
+The useful requirements extracted from the teacher comments were:
+
+- compare before and after transformation
+- use concrete metrics, not only final task scores
+- use multi-scale plots / histograms / heatmaps
+- include signal-to-noise style metrics
+- inspect whether adding SVD actually changes the weight / activation distribution
+- connect the distribution view with the SVD goal of preserving more semantically important directions
+
+This round implements the metric / plot / SQNR parts. KL-style histogram divergence was not included in this run and is recorded as a follow-up item.
+
+### Code Change
+
+Added a diagnostic script:
+
+- `diagnostics/qwen25_outlier_distribution.py`
+
+The script loads existing `flat_parameters.pth` files and does not rerun full calibration.
+
+### Compared States
+
+The diagnostic compared:
+
+| State | Meaning | Source |
+| --- | --- | --- |
+| `fp` | original floating-point Qwen2.5-3B base | `./modelzoo/Qwen/Qwen2.5-3B` |
+| `baseline` | established FlatQuant baseline | `outputs/Qwen2.5-3B/w4a4/qwen25_3b_base_w4a4kv4_lwc_lac_full_headmse_gpu0/` |
+| `svd_mix_linear` | A+B SVD-FlatQuant formal run | `outputs/Qwen2.5-3B/w4a4/qwen25_3b_base_w4a4kv4_lwc_lac_svd_mix_linear_a0p5_full_eval_gpu3_20260415_180145/` |
+
+### Run Command
+
+The run used GPU `0` and the `flatquant_svd` conda environment:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 conda run -n flatquant_svd python diagnostics/qwen25_outlier_distribution.py --nsamples 4
+```
+
+### Output Directory
+
+- `outputs/diagnostics/qwen25_3b_base_outlier_dist_baseline_vs_svd_mix_linear_20260528_005938/`
+
+Main outputs:
+
+- `summary.json`
+- `weight_stats_all.csv`
+- `activation_stats_all.csv`
+- per-state CSV files
+- heatmaps
+- representative histograms
+
+Full report:
+
+- `docs/report_outlier_distribution_qwen25_base_20260528.md`
+
+### Metrics
+
+Weight metrics included:
+
+- `abs_max_over_p99`
+- `p999_over_p50`
+- `per_out_max_over_median`
+- `w4_sym_per_out_mse`
+- `w4_sym_per_out_sqnr_db`
+
+Activation / token metrics included:
+
+- `abs_max_over_p99`
+- `p999_over_p50`
+- `token_score_p99`
+- `channel_max_over_median`
+- `a4_sym_token_mse`
+- `a4_sym_token_sqnr_db`
+
+where token outlier score is:
+
+- `max(abs(token)) / mean(abs(token))`
+
+### Global Weight Summary
+
+| Metric | FP | Baseline | SVD A+B |
+| --- | ---: | ---: | ---: |
+| `abs_max_over_p99` mean | `6.6690` | `2.6596` | `2.5746` |
+| `p999_over_p50` mean | `10.0473` | `5.6902` | `5.6919` |
+| `per_out_max_over_median` mean | `5.0389` | `3.0766` | `2.9404` |
+| `w4_sym_per_out_mse` mean | `2.2760e-05` | `9.6427e-05` | `9.7644e-05` |
+| `w4_sym_per_out_sqnr_db` mean | `14.9394` | `19.4555` | `19.4392` |
+
+### Global Activation Summary
+
+| Metric | FP | Baseline | SVD A+B |
+| --- | ---: | ---: | ---: |
+| `abs_max_over_p99` mean | `218.4837` | `2.9569` | `2.9881` |
+| `p999_over_p50` mean | `58.5018` | `5.8683` | `5.8460` |
+| `token_score_p99` mean | `119.0528` | `5.8646` | `5.8688` |
+| `channel_max_over_median` mean | `6511.8537` | `1.6619` | `1.6744` |
+| `a4_sym_token_mse` mean | `0.155963` | `0.000833` | `0.000820` |
+| `a4_sym_token_sqnr_db` mean | `6.4133` | `16.3468` | `16.3404` |
+
+### Baseline vs SVD A+B Improvement Counts
+
+Across all `252` layer-linear modules:
+
+| Metric | SVD A+B Improved / Total | Mean Delta `(SVD - Baseline)` | Median Delta |
+| --- | ---: | ---: | ---: |
+| weight `abs_max_over_p99` | `146 / 252` | `-0.08501374` | `-0.01417280` |
+| weight `per_out_max_over_median` | `146 / 252` | `-0.13618744` | `-0.01849365` |
+| weight `w4_sym_per_out_sqnr_db` | `66 / 252` | `-0.01631684` | `-0.01040521` |
+| activation `token_score_p99` | `106 / 252` | `0.00415793` | `0.00479412` |
+| activation `channel_max_over_median` | `133 / 252` | `0.01247359` | `-0.01031278` |
+| activation `a4_sym_token_sqnr_db` | `94 / 252` | `-0.00639549` | `-0.00396397` |
+| activation `a4_sym_token_mse` | `127 / 252` | `-0.00001257` | approximately `0` |
+
+### Representative Late-Layer Data
+
+Layer 34 `o_proj` activation:
+
+| Metric | FP | Baseline | SVD A+B |
+| --- | ---: | ---: | ---: |
+| `token_score_p99` | `24.683493` | `7.686549` | `7.694026` |
+| `channel_max_over_median` | `2.573427` | `2.275362` | `2.062016` |
+| `a4_sym_token_sqnr_db` | `9.562100` | `15.444544` | `15.357902` |
+| `a4_sym_token_mse` | `0.069418` | `0.012709` | `0.011612` |
+
+Layer 35 `down_proj` activation:
+
+| Metric | FP | Baseline | SVD A+B |
+| --- | ---: | ---: | ---: |
+| `token_score_p99` | `470.694580` | `6.062948` | `6.152538` |
+| `channel_max_over_median` | `132.961240` | `1.952569` | `1.966387` |
+| `a4_sym_token_sqnr_db` | `8.638284` | `15.602676` | `15.575827` |
+| `a4_sym_token_mse` | `0.411832` | `0.000892` | `0.000808` |
+
+Layer 35 `down_proj` weight:
+
+| Metric | FP | Baseline | SVD A+B |
+| --- | ---: | ---: | ---: |
+| `abs_max_over_p99` | `21.372263` | `4.275304` | `3.801527` |
+| `per_out_max_over_median` | `13.130045` | `4.327869` | `3.860465` |
+| `w4_sym_per_out_sqnr_db` | `13.073733` | `19.885132` | `19.825805` |
+| `w4_sym_per_out_mse` | `0.000030` | `0.000104` | `0.000116` |
+
+### Interpretation
+
+The diagnostic shows that the established FlatQuant baseline has a strong distribution effect:
+
+- FP activation `token_score_p99` mean: `119.0528`
+- baseline activation `token_score_p99` mean: `5.8646`
+- FP activation `a4_sym_token_sqnr_db` mean: `6.4133`
+- baseline activation `a4_sym_token_sqnr_db` mean: `16.3468`
+
+So baseline FlatQuant already changes the FP activation/token distributions into a much more quantization-friendly form.
+
+The current A+B SVD method does not add a clear global distribution-flattening effect over that baseline:
+
+- baseline activation `token_score_p99` mean: `5.8646`
+- SVD A+B activation `token_score_p99` mean: `5.8688`
+- baseline activation `a4_sym_token_sqnr_db` mean: `16.3468`
+- SVD A+B activation `a4_sym_token_sqnr_db` mean: `16.3404`
+
+For weights, SVD A+B slightly reduces some outlier ratios, but does not improve W4 SQNR on average:
+
+- baseline weight `abs_max_over_p99` mean: `2.6596`
+- SVD A+B weight `abs_max_over_p99` mean: `2.5746`
+- baseline weight `w4_sym_per_out_sqnr_db` mean: `19.4555`
+- SVD A+B weight `w4_sym_per_out_sqnr_db` mean: `19.4392`
+
+### Mechanism-Level Conclusion
+
+This round supports the following interpretation:
+
+- the established FlatQuant baseline already performs the major outlier-removal / distribution-flattening work
+- current A+B SVD-FlatQuant does not clearly make the ordinary weight / activation distributions more quantization-friendly than baseline
+- A+B SVD is better understood as an output-head-sensitive error-geometry reweighting method, consistent with the previous `head_proxy_mse` diagnostic
+- the lack of a strong additional distribution improvement is a plausible reason why A+B does not produce a clean across-the-board PPL win
+
+### Follow-Up
+
+Recommended follow-up diagnostics:
+
+1. Add KL / JS divergence on histograms for FP-vs-baseline and baseline-vs-SVD distribution comparison.
+2. Jointly plot `plain_mse`, `head_proxy_mse`, token outlier metrics, and A4/W4 SQNR for the same layers.
+3. Use the joint view to test whether layers with improved `head_proxy_mse` also show any distribution-side improvement, or whether the benefit is purely output-head-geometry based.
