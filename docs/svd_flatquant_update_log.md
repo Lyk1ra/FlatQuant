@@ -1297,3 +1297,149 @@ Recommended follow-up diagnostics:
 1. Add KL / JS divergence on histograms for FP-vs-baseline and baseline-vs-SVD distribution comparison.
 2. Jointly plot `plain_mse`, `head_proxy_mse`, token outlier metrics, and A4/W4 SQNR for the same layers.
 3. Use the joint view to test whether layers with improved `head_proxy_mse` also show any distribution-side improvement, or whether the benefit is purely output-head-geometry based.
+
+## 2026-05-29: Qwen2.5-3B Base KL/JS And Head-Proxy Alignment Diagnostic
+
+### Goal
+
+This round followed up on the 2026-05-28 outlier-distribution diagnostic by adding two analyses requested by the teacher-style feedback:
+
+- KL / JS-style histogram divergence to quantify distribution changes
+- joint alignment between `head_proxy_mse` improvement and ordinary outlier / SQNR metrics
+
+The main question was:
+
+- does A+B SVD-FlatQuant actually change the ordinary weight / activation distributions beyond baseline?
+- when `head_proxy_mse` improves, do token outliers and A4/W4 SQNR improve at the same time?
+
+### Code Change
+
+Added:
+
+- `diagnostics/qwen25_kl_js_head_alignment.py`
+
+### Run Command
+
+The run used GPU `0` and the `flatquant_svd` conda environment:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 conda run -n flatquant_svd python diagnostics/qwen25_kl_js_head_alignment.py --nsamples 4
+```
+
+### Output Directory
+
+- `outputs/diagnostics/qwen25_3b_base_kl_js_head_alignment_20260529_234646/`
+
+Main outputs:
+
+- `summary.json`
+- `kl_js_distribution_rows.csv`
+- `head_outlier_alignment_rows.csv`
+- JS heatmaps
+- head-proxy-vs-token-outlier scatter plot
+
+Reports:
+
+- `docs/report_kl_js_head_alignment_qwen25_base_20260529_zh.md`
+- `docs/report_explain_outlier_and_kljs_diagnostics_zh.md`
+
+### JS Divergence Results
+
+The diagnostic mainly reports JS divergence because it is symmetric and more stable than raw KL for histogram comparison.
+
+#### Activation absolute-value distribution
+
+| Pair | Mean JS | Median JS | Max JS | Count |
+| --- | ---: | ---: | ---: | ---: |
+| FP vs Baseline | `0.132993` | `0.139836` | `0.270863` | `32` |
+| Baseline vs SVD A+B | `0.000223` | `0.000131` | `0.000967` | `32` |
+| FP vs SVD A+B | `0.134866` | `0.136159` | `0.276501` | `32` |
+
+#### Token outlier-score distribution
+
+| Pair | Mean JS | Median JS | Max JS | Count |
+| --- | ---: | ---: | ---: | ---: |
+| FP vs Baseline | `0.687812` | `0.693089` | `0.693147` | `32` |
+| Baseline vs SVD A+B | `0.000444` | `0.000214` | `0.002077` | `32` |
+| FP vs SVD A+B | `0.687720` | `0.693147` | `0.693147` | `32` |
+
+#### Weight absolute-value distribution
+
+| Pair | Mean JS | Median JS | Max JS | Count |
+| --- | ---: | ---: | ---: | ---: |
+| FP vs Baseline | `0.136758` | `0.117388` | `0.297434` | `32` |
+| Baseline vs SVD A+B | `0.000585` | `0.000201` | `0.002869` | `32` |
+| FP vs SVD A+B | `0.137609` | `0.116241` | `0.307274` | `32` |
+
+### JS Interpretation
+
+The JS results show:
+
+- FP-to-baseline distribution change is large
+- FP-to-SVD-A+B distribution change is also large
+- baseline-to-SVD-A+B distribution change is extremely small
+
+For token outlier scores, the contrast is especially clear:
+
+- FP vs baseline mean JS: `0.687812`
+- baseline vs SVD A+B mean JS: `0.000444`
+
+This confirms that the ordinary distribution transformation is mainly caused by the FlatQuant baseline, not by the additional SVD A+B objective.
+
+### Head-Proxy / Outlier Alignment Results
+
+The alignment part compared final-epoch training metrics from the baseline and A+B logs with ordinary distribution metrics from the outlier diagnostic.
+
+Across all `252` layer-linear modules:
+
+| Metric | Improved Modules |
+| --- | ---: |
+| `head_proxy_mse` improved | `231 / 252` |
+| `plain_mse` improved | `70 / 252` |
+| activation `token_score_p99` improved | `106 / 252` |
+| activation `a4_sym_token_sqnr_db` improved | `94 / 252` |
+| weight `abs_max_over_p99` improved | `146 / 252` |
+| weight `w4_sym_per_out_sqnr_db` improved | `66 / 252` |
+
+This shows that A+B SVD improves the head-sensitive proxy in most layers, but that improvement does not synchronize with ordinary hidden-space MSE, token outlier metrics, or A4/W4 SQNR.
+
+### Representative Late-Layer Alignment
+
+#### Layer 34
+
+| Linear | Head Proxy Rel Delta | Plain MSE Rel Delta | Token Score Delta | A4 SQNR Delta |
+| --- | ---: | ---: | ---: | ---: |
+| `q_proj` | `-0.0405` | `0.0252` | `-0.0291` | `-0.0006` |
+| `o_proj` | `-0.0405` | `0.0252` | `0.0075` | `-0.0866` |
+| `up_proj` | `-0.0405` | `0.0252` | `0.0417` | `-0.0388` |
+| `down_proj` | `-0.0405` | `0.0252` | `0.1118` | `-0.0437` |
+
+#### Layer 35
+
+| Linear | Head Proxy Rel Delta | Plain MSE Rel Delta | Token Score Delta | A4 SQNR Delta |
+| --- | ---: | ---: | ---: | ---: |
+| `q_proj` | `-0.0609` | `0.0371` | `-0.0041` | `-0.0335` |
+| `o_proj` | `-0.0609` | `0.0371` | `0.1381` | `-0.0535` |
+| `up_proj` | `-0.0609` | `0.0371` | `-0.0492` | `0.0325` |
+| `down_proj` | `-0.0609` | `0.0371` | `0.0896` | `-0.0268` |
+
+In late layers, A+B improves `head_proxy_mse` clearly, but `plain_mse` becomes worse and activation SQNR usually does not improve.
+
+### Mechanism-Level Conclusion
+
+This round confirms the interpretation from the previous distribution diagnostic:
+
+- FlatQuant baseline is the main outlier-removal / distribution-flattening mechanism.
+- A+B SVD mainly changes output-head-sensitive error geometry.
+- The `head_proxy_mse` improvement does not automatically become ordinary activation/weight distribution improvement.
+- This explains why A+B can look meaningful under `head_proxy_mse`, while still not producing a clean across-the-board PPL or zero-shot win.
+
+### Follow-Up Direction
+
+If the SVD line continues, the next method should not only adjust SVD alpha or spectral weights. It should explicitly preserve the `head_proxy_mse` gain while preventing damage to:
+
+- `plain_mse`
+- activation token outliers
+- A4/W4 SQNR
+
+One possible direction is to add an activation quantization-noise or SQNR proxy term to the mixed objective.
